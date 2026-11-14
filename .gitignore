@@ -1,0 +1,31 @@
+# Android & Gradle
+.gradle/
+**/build/
+!android-app/gradle/
+local.properties
+*.iml
+.idea/
+.cxx/
+captures/
+.externalNativeBuild/
+
+# Keystores & Secrets (NUNCA versionar chaves de assinatura)
+*.jks
+*.keystore
+.env
+
+# Binários compilados (publique na aba "Releases" do GitHub)
+*.apk
+*.idsig
+*.aab
+*.exe
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
