@@ -1,5 +1,10 @@
 package com.pessoal.pcpower.ui
 
+import android.content.Context
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -20,9 +25,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Computer
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SettingsEthernet
@@ -59,6 +67,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
@@ -67,13 +76,32 @@ import com.pessoal.pcpower.data.PcConfig
 import com.pessoal.pcpower.data.PcConfigStore
 import com.pessoal.pcpower.network.PcPowerClient
 import com.pessoal.pcpower.network.PcStatusResult
+import com.pessoal.pcpower.network.WolDiagnostics
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
+private fun triggerHapticSuccess(context: Context) {
+    try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+            vibratorManager?.defaultVibrator?.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK))
+        } else {
+            @Suppress("DEPRECATION")
+            val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                vibrator?.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK))
+            } else {
+                vibrator?.vibrate(150)
+            }
+        }
+    } catch (_: Exception) { }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PowerRemoteScreen(configStore: PcConfigStore) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -90,8 +118,14 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
     var isCheckingStatus by remember { mutableStateOf(false) }
     var isSearchingNetwork by remember { mutableStateOf(false) }
     var isSendingCommand by remember { mutableStateOf(false) }
+    var isWakingUp by remember { mutableStateOf(false) }
+    var wakingProgressSeconds by remember { mutableStateOf(0) }
+
+    var wolDiag by remember { mutableStateOf<WolDiagnostics?>(null) }
     var showShutdownConfirm by remember { mutableStateOf(false) }
+    var showRestartConfirm by remember { mutableStateOf(false) }
     var showManualFields by remember { mutableStateOf(false) }
+    var shutdownDelayInput by remember { mutableStateOf("5") }
     var discoveredPcsDialog by remember { mutableStateOf<List<PcStatusResult>>(emptyList()) }
     var lastStatusMessage by remember { mutableStateOf("Procurando computador automaticamente na rede...") }
 
@@ -111,6 +145,7 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
         pc.ipAddress?.let { ipInput = it }
         pc.macAddress?.let { macInput = it }
         portInput = pc.port.toString()
+        wolDiag = pc.wolDiagnostics
         lastStatusMessage = "Conectado automaticamente a $hostname ($ipInput)"
         val updated = currentConfig()
         configStore.save(updated)
@@ -146,6 +181,7 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
     }
 
     suspend fun refreshStatus() {
+        if (isWakingUp) return
         isCheckingStatus = true
         val cfg = currentConfig()
         val status = PcPowerClient.checkStatus(cfg)
@@ -155,12 +191,55 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
             status.hostname?.let { hostname = it }
             status.ipAddress?.let { ipInput = it }
             status.macAddress?.let { macInput = it }
+            status.wolDiagnostics?.let { wolDiag = it }
             val updated = currentConfig()
             configStore.save(updated)
             savedConfig = updated
             savedPcs = configStore.loadSavedPcs()
         }
         isCheckingStatus = false
+    }
+
+    fun executeWakeOnLan() {
+        scope.launch {
+            val cfg = currentConfig()
+            configStore.save(cfg)
+            savedConfig = cfg
+
+            isWakingUp = true
+            wakingProgressSeconds = 0
+            lastStatusMessage = "⚡ Enviando pacote mágico (WoL) e aguardando inicialização..."
+
+            // Disparo redundante em rajada (burst)
+            PcPowerClient.sendWakeOnLan(cfg.macAddress, cfg.ipAddress, burstCount = 3)
+
+            val startTime = System.currentTimeMillis()
+            val maxWaitMs = 45_000L
+            var wokeUp = false
+
+            while (System.currentTimeMillis() - startTime < maxWaitMs) {
+                delay(1500)
+                wakingProgressSeconds = ((System.currentTimeMillis() - startTime) / 1000).toInt()
+                val check = PcPowerClient.checkStatus(cfg)
+                if (check.isOnline) {
+                    wokeUp = true
+                    isOnline = true
+                    check.hostname?.let { hostname = it }
+                    check.wolDiagnostics?.let { wolDiag = it }
+                    lastStatusMessage = "✔ Computador ligado e pronto!"
+                    break
+                }
+            }
+
+            isWakingUp = false
+            if (wokeUp) {
+                triggerHapticSuccess(context)
+                snackbarHostState.showSnackbar("✔ O computador ligou com sucesso!")
+                refreshStatus()
+            } else {
+                snackbarHostState.showSnackbar("O computador não respondeu após 45s. Verifique o cabo de rede ou a BIOS.")
+            }
+        }
     }
 
     LaunchedEffect(savedConfig.ipAddress, savedConfig.macAddress, savedConfig.port) {
@@ -170,7 +249,7 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
         }
     }
 
-    // Modal de seleção quando há mais de 1 PC ligado na casa
+    // Modal de múltiplos computadores na rede
     if (discoveredPcsDialog.isNotEmpty()) {
         AlertDialog(
             onDismissRequest = { discoveredPcsDialog = emptyList() },
@@ -218,12 +297,23 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
         )
     }
 
+    // Modal Desligar
     if (showShutdownConfirm) {
         AlertDialog(
             onDismissRequest = { showShutdownConfirm = false },
             title = { Text("Desligar Computador?") },
             text = {
-                Text("Tem certeza que deseja desligar o computador $hostname ($ipInput) agora?")
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Tem certeza que deseja desligar o computador $hostname ($ipInput)?")
+                    OutlinedTextField(
+                        value = shutdownDelayInput,
+                        onValueChange = { shutdownDelayInput = it.filter { ch -> ch.isDigit() } },
+                        label = { Text("Tempo de espera (segundos)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             },
             confirmButton = {
                 Button(
@@ -235,9 +325,10 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
                         showShutdownConfirm = false
                         scope.launch {
                             isSendingCommand = true
+                            val delaySec = shutdownDelayInput.toIntOrNull() ?: 5
                             val cfg = currentConfig()
                             configStore.save(cfg)
-                            val result = PcPowerClient.sendShutdownCommand(cfg, cancel = false, delaySeconds = 5)
+                            val result = PcPowerClient.sendShutdownCommand(cfg, cancel = false, delaySeconds = delaySec)
                             isSendingCommand = false
                             snackbarHostState.showSnackbar(result.message)
                             delay(1500)
@@ -250,6 +341,44 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
             },
             dismissButton = {
                 TextButton(onClick = { showShutdownConfirm = false }) {
+                    Text("Cancelar")
+                }
+            }
+        )
+    }
+
+    // Modal Reiniciar
+    if (showRestartConfirm) {
+        AlertDialog(
+            onDismissRequest = { showRestartConfirm = false },
+            title = { Text("Reiniciar Computador?") },
+            text = {
+                Text("Deseja reiniciar $hostname ($ipInput) agora?")
+            },
+            confirmButton = {
+                Button(
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFEF6C00),
+                        contentColor = Color.White
+                    ),
+                    onClick = {
+                        showRestartConfirm = false
+                        scope.launch {
+                            isSendingCommand = true
+                            val cfg = currentConfig()
+                            val result = PcPowerClient.sendPowerCommand(cfg, "/restart", delaySeconds = 5)
+                            isSendingCommand = false
+                            snackbarHostState.showSnackbar(result.message)
+                            delay(1500)
+                            refreshStatus()
+                        }
+                    }
+                ) {
+                    Text("Reiniciar")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRestartConfirm = false }) {
                     Text("Cancelar")
                 }
             }
@@ -317,7 +446,7 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Seletor rápido de PCs pareados na casa
+            // Seletor rápido de PCs pareados
             if (savedPcs.size > 1) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -344,6 +473,7 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
                 }
             }
 
+            // Card Principal
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
@@ -358,7 +488,11 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     val statusColor by animateColorAsState(
-                        targetValue = if (isOnline) Color(0xFF2E7D32) else Color(0xFF757575),
+                        targetValue = when {
+                            isWakingUp -> Color(0xFFF57C00)
+                            isOnline -> Color(0xFF2E7D32)
+                            else -> Color(0xFF757575)
+                        },
                         label = "statusColor"
                     )
 
@@ -371,15 +505,27 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(10.dp)
-                                    .clip(CircleShape)
-                                    .background(statusColor)
-                            )
+                            if (isWakingUp) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(12.dp),
+                                    strokeWidth = 2.dp,
+                                    color = statusColor
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .size(10.dp)
+                                        .clip(CircleShape)
+                                        .background(statusColor)
+                                )
+                            }
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = if (isOnline) "COMPUTADOR LIGADO" else "COMPUTADOR DESLIGADO",
+                                text = when {
+                                    isWakingUp -> "INICIALIZANDO PC (${wakingProgressSeconds}s)..."
+                                    isOnline -> "COMPUTADOR LIGADO"
+                                    else -> "COMPUTADOR DESLIGADO"
+                                },
                                 color = statusColor,
                                 style = MaterialTheme.typography.labelLarge,
                                 fontWeight = FontWeight.Bold
@@ -393,21 +539,32 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
 
+                    // Selo de Diagnóstico WoL
+                    if (wolDiag != null) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        val isEth = wolDiag?.isEthernet == true
+                        val ready = wolDiag?.readyForWol == true
+                        Surface(
+                            color = if (ready) Color(0xFF1B5E20).copy(alpha = 0.2f) else Color(0xFFE65100).copy(alpha = 0.2f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = if (ready) "🟢 Diagnóstico WoL: Pronto via Cabo Ethernet"
+                                else if (!isEth) "🟡 Diagnóstico WoL: PC em Wi-Fi (WoL pode falhar com PC desligado)"
+                                else "🔴 Diagnóstico WoL: Placa não autorizada a acordar",
+                                color = if (ready) Color(0xFF81C784) else Color(0xFFFFB74D),
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                            )
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(20.dp))
 
+                    // Botão Ligar (WoL) com confirmação e animação
                     Button(
-                        onClick = {
-                            scope.launch {
-                                isSendingCommand = true
-                                val cfg = currentConfig()
-                                configStore.save(cfg)
-                                savedConfig = cfg
-                                val result = PcPowerClient.sendWakeOnLan(cfg.macAddress, cfg.ipAddress)
-                                isSendingCommand = false
-                                snackbarHostState.showSnackbar(result.message)
-                            }
-                        },
-                        enabled = !isSendingCommand,
+                        onClick = { executeWakeOnLan() },
+                        enabled = !isSendingCommand && !isWakingUp,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(58.dp),
@@ -417,24 +574,39 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
                             contentColor = Color.White
                         )
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.PowerSettingsNew,
-                            contentDescription = null,
-                            modifier = Modifier.size(24.dp)
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text(
-                            text = "LIGAR COMPUTADOR (Wake-on-LAN)",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold
-                        )
+                        if (isWakingUp) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(24.dp),
+                                color = Color.White,
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = "AGUARDANDO DESPERTAR...",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.PowerSettingsNew,
+                                contentDescription = null,
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = "LIGAR COMPUTADOR (Wake-on-LAN)",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))
 
+                    // Botão Desligar
                     Button(
                         onClick = { showShutdownConfirm = true },
-                        enabled = !isSendingCommand,
+                        enabled = !isSendingCommand && !isWakingUp,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(58.dp),
@@ -457,6 +629,61 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
                         )
                     }
 
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    // Novas Ações de Energia: Suspender, Reiniciar, Bloquear
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilledTonalButton(
+                            onClick = {
+                                scope.launch {
+                                    isSendingCommand = true
+                                    val res = PcPowerClient.sendPowerCommand(currentConfig(), "/sleep")
+                                    isSendingCommand = false
+                                    snackbarHostState.showSnackbar(res.message)
+                                    delay(2000)
+                                    refreshStatus()
+                                }
+                            },
+                            enabled = !isSendingCommand && isOnline,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.Bedtime, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Dormir", style = MaterialTheme.typography.labelMedium)
+                        }
+
+                        FilledTonalButton(
+                            onClick = { showRestartConfirm = true },
+                            enabled = !isSendingCommand && isOnline,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.RestartAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Reiniciar", style = MaterialTheme.typography.labelMedium)
+                        }
+
+                        FilledTonalButton(
+                            onClick = {
+                                scope.launch {
+                                    val res = PcPowerClient.sendPowerCommand(currentConfig(), "/lock")
+                                    snackbarHostState.showSnackbar(res.message)
+                                }
+                            },
+                            enabled = !isSendingCommand && isOnline,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Bloquear", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(8.dp))
 
                     OutlinedButton(
@@ -472,11 +699,12 @@ fun PowerRemoteScreen(configStore: PcConfigStore) {
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Text("Cancelar Desligamento em Andamento")
+                        Text("Cancelar Desligamento / Reinício")
                     }
                 }
             }
 
+            // Card Descoberta e Configuração
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp)

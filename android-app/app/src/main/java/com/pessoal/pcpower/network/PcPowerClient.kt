@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -18,6 +19,14 @@ import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.URL
 
+data class WolDiagnostics(
+    val isEthernet: Boolean = true,
+    val adapterName: String = "",
+    val wakeArmed: Boolean = true,
+    val fastStartupDisabled: Boolean = true,
+    val readyForWol: Boolean = true
+)
+
 data class PcStatusResult(
     val isOnline: Boolean,
     val hostname: String? = null,
@@ -25,6 +34,7 @@ data class PcStatusResult(
     val ipAddress: String? = null,
     val port: Int = 5050,
     val requiresPin: Boolean = false,
+    val wolDiagnostics: WolDiagnostics? = null,
     val message: String = ""
 )
 
@@ -84,6 +94,16 @@ object PcPowerClient {
                             val foundMac = json.optString("mac").uppercase()
                             val foundHost = json.optString("hostname", "Computador")
                             val foundPort = json.optInt("port", httpPort)
+                            val diagJson = json.optJSONObject("wolDiagnostics")
+                            val diag = diagJson?.let {
+                                WolDiagnostics(
+                                    isEthernet = it.optBoolean("isEthernet", true),
+                                    adapterName = it.optString("adapterName", ""),
+                                    wakeArmed = it.optBoolean("wakeArmed", true),
+                                    fastStartupDisabled = it.optBoolean("fastStartupDisabled", true),
+                                    readyForWol = it.optBoolean("readyForWol", true)
+                                )
+                            }
                             val key = if (foundMac.isNotEmpty()) foundMac else foundIp
 
                             if (foundIp.isNotEmpty()) {
@@ -94,6 +114,7 @@ object PcPowerClient {
                                     ipAddress = foundIp,
                                     port = foundPort,
                                     requiresPin = json.optBoolean("requiresPin", false),
+                                    wolDiagnostics = diag,
                                     message = "Conectado a $foundHost ($foundIp)"
                                 )
                             }
@@ -150,6 +171,16 @@ object PcPowerClient {
                 val json = JSONObject(response)
                 val host = json.optString("hostname").takeIf { it.isNotEmpty() }
                 val remoteIp = json.optString("ip").ifEmpty { ip }
+                val diagJson = json.optJSONObject("wolDiagnostics")
+                val diag = diagJson?.let {
+                    WolDiagnostics(
+                        isEthernet = it.optBoolean("isEthernet", true),
+                        adapterName = it.optString("adapterName", ""),
+                        wakeArmed = it.optBoolean("wakeArmed", true),
+                        fastStartupDisabled = it.optBoolean("fastStartupDisabled", true),
+                        readyForWol = it.optBoolean("readyForWol", true)
+                    )
+                }
                 PcStatusResult(
                     isOnline = true,
                     hostname = host,
@@ -157,6 +188,7 @@ object PcPowerClient {
                     ipAddress = remoteIp,
                     port = json.optInt("port", port),
                     requiresPin = json.optBoolean("requiresPin", false),
+                    wolDiagnostics = diag,
                     message = "Conectado a ${host ?: "PC"} ($remoteIp)"
                 )
             } else null
@@ -188,35 +220,39 @@ object PcPowerClient {
     }
 
     /**
-     * Envia o Magic Packet (Wake-on-LAN) via UDP nas portas 9 e 7
+     * Envia o Magic Packet (Wake-on-LAN) em rajada (burst) para garantir entrega na rede local
      */
-    suspend fun sendWakeOnLan(macAddress: String, ipAddress: String): ActionResult =
-        withContext(Dispatchers.IO) {
-            try {
-                val macBytes = parseMacAddress(macAddress)
-                val magicPacket = ByteArray(6 + 16 * macBytes.size)
-                for (i in 0 until 6) {
-                    magicPacket[i] = 0xFF.toByte()
-                }
-                for (i in 6 until magicPacket.size step macBytes.size) {
-                    System.arraycopy(macBytes, 0, magicPacket, i, macBytes.size)
-                }
+    suspend fun sendWakeOnLan(
+        macAddress: String,
+        ipAddress: String,
+        burstCount: Int = 3
+    ): ActionResult = withContext(Dispatchers.IO) {
+        try {
+            val macBytes = parseMacAddress(macAddress)
+            val magicPacket = ByteArray(6 + 16 * macBytes.size)
+            for (i in 0 until 6) {
+                magicPacket[i] = 0xFF.toByte()
+            }
+            for (i in 6 until magicPacket.size step macBytes.size) {
+                System.arraycopy(macBytes, 0, magicPacket, i, macBytes.size)
+            }
 
-                val targets = mutableSetOf("255.255.255.255")
-                val localIp = getPhoneLocalIp()
-                val localPrefix = localIp?.substringBeforeLast(".", "") ?: ""
-                if (localPrefix.isNotEmpty()) {
-                    targets.add("$localPrefix.255")
-                }
+            val targets = mutableSetOf("255.255.255.255")
+            val localIp = getPhoneLocalIp()
+            val localPrefix = localIp?.substringBeforeLast(".", "") ?: ""
+            if (localPrefix.isNotEmpty()) {
+                targets.add("$localPrefix.255")
+            }
 
-                val parts = ipAddress.trim().split(".")
-                if (parts.size == 4) {
-                    targets.add("${parts[0]}.${parts[1]}.${parts[2]}.255")
-                    targets.add(ipAddress.trim())
-                }
+            val parts = ipAddress.trim().split(".")
+            if (parts.size == 4) {
+                targets.add("${parts[0]}.${parts[1]}.${parts[2]}.255")
+                targets.add(ipAddress.trim())
+            }
 
-                DatagramSocket().use { socket ->
-                    socket.broadcast = true
+            DatagramSocket().use { socket ->
+                socket.broadcast = true
+                for (b in 1..burstCount) {
                     for (target in targets) {
                         val address = InetAddress.getByName(target)
                         for (port in listOf(9, 7)) {
@@ -224,21 +260,25 @@ object PcPowerClient {
                             socket.send(packet)
                         }
                     }
+                    if (b < burstCount) {
+                        delay(120)
+                    }
                 }
-
-                ActionResult(
-                    success = true,
-                    message = "⚡ Pacote Wake-on-LAN enviado para $macAddress!"
-                )
-            } catch (e: IllegalArgumentException) {
-                ActionResult(success = false, message = e.message ?: "MAC Address inválido.")
-            } catch (e: Exception) {
-                ActionResult(
-                    success = false,
-                    message = "Erro ao enviar Wake-on-LAN: ${e.localizedMessage ?: e.javaClass.simpleName}"
-                )
             }
+
+            ActionResult(
+                success = true,
+                message = "⚡ Pacote Wake-on-LAN enviado para $macAddress!"
+            )
+        } catch (e: IllegalArgumentException) {
+            ActionResult(success = false, message = e.message ?: "MAC Address inválido.")
+        } catch (e: Exception) {
+            ActionResult(
+                success = false,
+                message = "Erro ao enviar Wake-on-LAN: ${e.localizedMessage ?: e.javaClass.simpleName}"
+            )
         }
+    }
 
     /**
      * Verifica se o PC está online. Se o IP antigo não responder (ex: roteador trocou o IP via DHCP),
@@ -280,11 +320,12 @@ object PcPowerClient {
     }
 
     /**
-     * Envia o comando de desligamento (POST /shutdown) ou cancelamento (POST /cancel-shutdown) ao PC.
+     * Envia qualquer comando de energia ao PC:
+     * endpoint: /shutdown, /restart, /sleep, /hibernate, /lock, /cancel-shutdown
      */
-    suspend fun sendShutdownCommand(
+    suspend fun sendPowerCommand(
         config: PcConfig,
-        cancel: Boolean = false,
+        endpoint: String,
         delaySeconds: Int = 5
     ): ActionResult = withContext(Dispatchers.IO) {
         val ip = config.ipAddress.trim()
@@ -292,10 +333,10 @@ object PcPowerClient {
             return@withContext ActionResult(false, "Toque em 'Buscar PC na Rede' primeiro.")
         }
 
-        val endpoint = if (cancel) "/cancel-shutdown" else "/shutdown"
+        val cleanEndpoint = if (endpoint.startsWith("/")) endpoint else "/$endpoint"
         var connection: HttpURLConnection? = null
         try {
-            val url = URL("http://$ip:${config.port}$endpoint")
+            val url = URL("http://$ip:${config.port}$cleanEndpoint")
             connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 connectTimeout = 3000
@@ -327,17 +368,29 @@ object PcPowerClient {
 
             val json = runCatching { JSONObject(body) }.getOrNull()
             val msg = json?.optString("message")?.takeIf { it.isNotEmpty() }
-                ?: if (code in 200..299) "Comando enviado com sucesso!" else "Erro HTTP $code"
+                ?: if (code in 200..299) "Comando executado com sucesso!" else "Erro HTTP $code"
 
             ActionResult(success = code in 200..299, message = msg)
         } catch (e: Exception) {
             ActionResult(
                 success = false,
-                message = "Não foi possível conectar ao PC ($ip:${config.port}). Verifique se o PC está ligado e na mesma rede Wi-Fi."
+                message = "Não foi possível conectar ao PC ($ip:${config.port}). Verifique se o PC está ligado e no mesmo Wi-Fi."
             )
         } finally {
             connection?.disconnect()
         }
+    }
+
+    suspend fun sendShutdownCommand(
+        config: PcConfig,
+        cancel: Boolean = false,
+        delaySeconds: Int = 5
+    ): ActionResult {
+        return sendPowerCommand(
+            config,
+            if (cancel) "/cancel-shutdown" else "/shutdown",
+            delaySeconds
+        )
     }
 
     private fun parseMacAddress(mac: String): ByteArray {

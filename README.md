@@ -1,6 +1,6 @@
 # PC Power Remote (Android + Windows Agent)
 
-Controle o seu computador (**Ligar via Wake-on-LAN** e **Desligar via Rede Local**) diretamente pelo celular Android conectado no mesmo Wi-Fi — **com descoberta automática na rede** (sem precisar digitar IP ou MAC Address manualmente).
+Controle o seu computador (**Ligar via Wake-on-LAN**, **Desligar**, **Suspender / Sleep**, **Reiniciar** e **Bloquear Tela**) diretamente pelo celular Android conectado no mesmo Wi-Fi — **com descoberta automática na rede** e **diagnóstico em tempo real**.
 
 ---
 
@@ -8,10 +8,20 @@ Controle o seu computador (**Ligar via Wake-on-LAN** e **Desligar via Rede Local
 
 - **🔍 Descoberta Automática na Rede (Zero Configuração Manual):**
   - O aplicativo Android encontra automaticamente qualquer computador rodando o agente no mesmo Wi-Fi (via *UDP Broadcast* na porta `5051` + varredura inteligente de sub-rede `/24` na porta `5050`) e preenche o **IP**, **MAC Address** e **Nome do PC** sozinho.
-- **⚡ Ligar Computador (Wake-on-LAN):**
-  - Envia o *Magic Packet* UDP (portas `9` e `7`) para acordar/ligar o computador mesmo quando ele está desligado.
-- **⏻ Desligar Computador & Cancelar Desligamento:**
-  - Envia o comando de desligamento seguro para o agente no Windows (com confirmação e opção de cancelar em até 5 segundos).
+  - Suporte a múltiplos computadores com seletor rápido no topo da tela.
+- **⚡ Ligar Computador com Feedback Tátil & Polling Ativo:**
+  - Envia o *Magic Packet* UDP em rajada redundante (portas `9` e `7`).
+  - Interface com animação de progresso e **vibração tátil** no celular assim que o PC liga.
+- **🩺 Diagnóstico de Compatibilidade WoL:**
+  - O agente no Windows analisa o adaptador de rede ativo e exibe um selo informativo:
+    - 🟢 *Pronto via Cabo Ethernet*
+    - 🟡 *Alerta de Wi-Fi (WoL pode falhar com PC 100% desligado)*
+    - 🔴 *Placa de rede não autorizada a acordar o PC*
+- **🎮 Controle Completo de Energia:**
+  - **⏻ Desligar** (com temporizador configurável e cancelamento em andamento)
+  - **🌙 Suspender / Dormir (Sleep)**
+  - **🔄 Reiniciar (Restart)**
+  - **🔒 Bloquear Tela (`Win + L`)**
 - **🔒 Segurança para Redes Locais:**
   - Suporte opcional a **PIN de Segurança** no agente Windows e no app Android.
   - Regras de Firewall restritas exclusivamente a **Redes Privadas** (`profile=private,domain`), bloqueando acessos caso o computador seja conectado a redes Wi-Fi públicas.
@@ -21,11 +31,11 @@ Controle o seu computador (**Ligar via Wake-on-LAN** e **Desligar via Rede Local
 ## 📂 Estrutura do Repositório
 
 - `pc-agent/` — Agente e configurador automático para Windows:
-  - [`PCPowerSetup_e_Agente.cs`](file:///c:/Users/Usuario/Downloads/Projetos/Pessoal/pc-agent/PCPowerSetup_e_Agente.cs): Código-fonte C# do executável standalone para Windows (com painel visual, ícone na bandeja do sistema, servidor HTTP `5050`, servidor de descoberta UDP `5051` e configuração automática de Wake-on-LAN, Firewall e Inicialização do Windows).
+  - [`PCPowerSetup_e_Agente.cs`](file:///c:/Users/Usuario/Downloads/Projetos/Pessoal/pc-agent/PCPowerSetup_e_Agente.cs): Executável standalone para Windows (com painel visual, ícone na bandeja do sistema, servidor HTTP `5050`, servidor de descoberta UDP `5051`, diagnóstico WoL e suporte a Sleep, Lock e Restart).
   - [`pc_power_agent.py`](file:///c:/Users/Usuario/Downloads/Projetos/Pessoal/pc-agent/pc_power_agent.py): Alternativa multiplataforma em Python puro (sem dependências externas).
 - `android-app/` — Código-fonte do aplicativo Android nativo em **Kotlin + Jetpack Compose (Material 3)**:
-  - [`PcPowerClient.kt`](file:///c:/Users/Usuario/Downloads/Projetos/Pessoal/android-app/app/src/main/java/com/pessoal/pcpower/network/PcPowerClient.kt): Cliente de descoberta automática na rede, envio de Magic Packet (Wake-on-LAN) e controle HTTP.
-  - [`PowerRemoteScreen.kt`](file:///c:/Users/Usuario/Downloads/Projetos/Pessoal/android-app/app/src/main/java/com/pessoal/pcpower/ui/PowerRemoteScreen.kt): Interface principal em Jetpack Compose.
+  - [`PcPowerClient.kt`](file:///c:/Users/Usuario/Downloads/Projetos/Pessoal/android-app/app/src/main/java/com/pessoal/pcpower/network/PcPowerClient.kt): Cliente de descoberta automática na rede, envio em rajada de Magic Packet (Wake-on-LAN), comandos de energia e diagnóstico.
+  - [`PowerRemoteScreen.kt`](file:///c:/Users/Usuario/Downloads/Projetos/Pessoal/android-app/app/src/main/java/com/pessoal/pcpower/ui/PowerRemoteScreen.kt): Interface principal em Jetpack Compose com suporte a novos botões e vibração tátil.
 
 ---
 

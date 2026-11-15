@@ -4,10 +4,11 @@
 Agente PC Power Remote (Windows / Linux)
 Servidor HTTP (porta 5050) + Descoberta Automática UDP (porta 5051) na rede local:
 - Responde automaticamente à busca do aplicativo Android na rede Wi-Fi (UDP 5051)
-- Informa status (online, hostname, IP e MAC Address) via HTTP GET /status
-- Recebe o comando de desligamento (Shutdown) pela rede local
+- Informa status (online, hostname, IP, MAC Address e diagnóstico WoL) via HTTP GET /status
+- Executa ações remotas: /shutdown, /restart, /sleep, /hibernate, /lock, /cancel-shutdown
 """
 
+import ctypes
 import json
 import os
 import platform
@@ -16,6 +17,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -60,6 +62,55 @@ def get_mac_address(target_ip: str) -> str:
     return ":".join(mac_hex[i : i + 2] for i in range(0, 12, 2))
 
 
+def get_wol_diagnostics() -> dict:
+    """Verifica se o computador está em Ethernet e com WoL ativado."""
+    is_ethernet = True
+    adapter_name = "Ethernet"
+    wake_armed = True
+    fast_startup_disabled = True
+
+    if platform.system().lower() == "windows":
+        try:
+            output = subprocess.check_output(
+                ["netsh", "interface", "show", "interface"],
+                encoding="oem",
+                errors="ignore",
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if "Wi-Fi" in output or "Wireless" in output:
+                # Verifica se a interface conectada é wireless
+                ip_out = subprocess.check_output(
+                    ["ipconfig"],
+                    encoding="oem",
+                    errors="ignore",
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                if "Wi-Fi" in ip_out or "Wireless" in ip_out:
+                    is_ethernet = False
+                    adapter_name = "Wi-Fi"
+        except Exception:
+            pass
+
+        try:
+            armed_out = subprocess.check_output(
+                ["powercfg", "/devicequery", "wake_armed"],
+                encoding="oem",
+                errors="ignore",
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            wake_armed = len(armed_out.strip()) > 0
+        except Exception:
+            pass
+
+    return {
+        "isEthernet": is_ethernet,
+        "adapterName": adapter_name,
+        "wakeArmed": wake_armed,
+        "fastStartupDisabled": fast_startup_disabled,
+        "readyForWol": is_ethernet and wake_armed,
+    }
+
+
 def build_status_payload() -> dict:
     ip = get_local_ip()
     mac = get_mac_address(ip)
@@ -70,6 +121,7 @@ def build_status_payload() -> dict:
         "mac": mac,
         "port": PORT,
         "requiresPin": bool(PIN_CODE),
+        "wolDiagnostics": get_wol_diagnostics(),
     }
 
 
@@ -134,9 +186,10 @@ class PowerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"ok": False, "message": "PIN inválido ou não informado."})
             return
 
+        delay = int(body_data.get("delay", 5))
+        delay = max(0, min(delay, 3600))
+
         if self.path == "/shutdown":
-            delay = int(body_data.get("delay", 5))
-            delay = max(0, min(delay, 300))
             try:
                 if platform.system().lower() == "windows":
                     subprocess.Popen(
@@ -152,7 +205,7 @@ class PowerRequestHandler(BaseHTTPRequestHandler):
                         creationflags=subprocess.CREATE_NO_WINDOW,
                     )
                 else:
-                    subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+                    subprocess.Popen(["sudo", "shutdown", "-h", f"+{delay // 60}"])
 
                 self._send_json(
                     200,
@@ -164,6 +217,73 @@ class PowerRequestHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"ok": False, "message": f"Erro ao desligar: {e}"})
 
+        elif self.path == "/restart":
+            try:
+                if platform.system().lower() == "windows":
+                    subprocess.Popen(
+                        [
+                            "shutdown",
+                            "/r",
+                            "/f",
+                            "/t",
+                            str(delay),
+                            "/c",
+                            "Reinício solicitado pelo aplicativo Android (PC Power Remote).",
+                        ],
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                else:
+                    subprocess.Popen(["sudo", "shutdown", "-r", f"+{delay // 60}"])
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "message": f"Comando enviado! O PC será reiniciado em {delay} segundos.",
+                    },
+                )
+            except Exception as e:
+                self._send_json(500, {"ok": False, "message": f"Erro ao reiniciar: {e}"})
+
+        elif self.path == "/sleep":
+            try:
+                if platform.system().lower() == "windows":
+                    def _suspend():
+                        time.sleep(0.8)
+                        ctypes.windll.powrprof.SetSuspendState(0, 1, 1)
+                    threading.Thread(target=_suspend, daemon=True).start()
+                else:
+                    subprocess.Popen(["systemctl", "suspend"])
+
+                self._send_json(200, {"ok": True, "message": "Computador entrando em modo de suspensão..."})
+            except Exception as e:
+                self._send_json(500, {"ok": False, "message": f"Erro ao suspender: {e}"})
+
+        elif self.path == "/hibernate":
+            try:
+                if platform.system().lower() == "windows":
+                    def _hibernate():
+                        time.sleep(0.8)
+                        ctypes.windll.powrprof.SetSuspendState(1, 1, 1)
+                    threading.Thread(target=_hibernate, daemon=True).start()
+                else:
+                    subprocess.Popen(["systemctl", "hibernate"])
+
+                self._send_json(200, {"ok": True, "message": "Computador entrando em hibernação..."})
+            except Exception as e:
+                self._send_json(500, {"ok": False, "message": f"Erro ao hibernar: {e}"})
+
+        elif self.path == "/lock":
+            try:
+                if platform.system().lower() == "windows":
+                    ctypes.windll.user32.LockWorkStation()
+                else:
+                    subprocess.Popen(["loginctl", "lock-session"])
+
+                self._send_json(200, {"ok": True, "message": "Tela do computador bloqueada com sucesso!"})
+            except Exception as e:
+                self._send_json(500, {"ok": False, "message": f"Erro ao bloquear tela: {e}"})
+
         elif self.path == "/cancel-shutdown":
             try:
                 if platform.system().lower() == "windows":
@@ -173,7 +293,7 @@ class PowerRequestHandler(BaseHTTPRequestHandler):
                     )
                 self._send_json(
                     200,
-                    {"ok": True, "message": "Desligamento cancelado com sucesso."},
+                    {"ok": True, "message": "Desligamento/reinício cancelado com sucesso."},
                 )
             except Exception as e:
                 self._send_json(500, {"ok": False, "message": f"Erro ao cancelar: {e}"})
@@ -204,8 +324,10 @@ def main():
         print(f"  MAC Address  : {info['mac']}")
         print(f"  Porta HTTP   : {PORT} | Descoberta UDP: {DISCOVERY_UDP_PORT}")
         print(f"  PIN Ativo    : {'Sim' if PIN_CODE else 'Nao (livre na rede privada)'}")
+        diag = info.get("wolDiagnostics", {})
+        print(f"  Diagnóstico WoL: {'Pronto (Ethernet)' if diag.get('readyForWol') else 'Verificar conexão'}")
         print("=" * 60)
-        print("Abra o aplicativo no celular e toque em 'Buscar PC na Rede'.")
+        print("Ações suportadas: Ligar, Desligar, Reiniciar, Suspender, Bloquear")
         print("Pressione Ctrl+C para encerrar.\n")
 
     try:

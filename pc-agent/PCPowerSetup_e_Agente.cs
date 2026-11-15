@@ -8,6 +8,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -19,10 +20,19 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("Configurador automatico de Wake-on-LAN, Descoberta na Rede e Agente de Desligamento Remoto")]
 [assembly: AssemblyCompany("PC Power Remote")]
 [assembly: AssemblyProduct("PC Power Remote")]
-[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
 
 namespace PCPowerRemote
 {
+    static class NativeMethods
+    {
+        [DllImport("PowrProf.dll", SetLastError = true)]
+        public static extern bool SetSuspendState(bool hibernate, bool forceCritical, bool disableWakeEvent);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool LockWorkStation();
+    }
+
     static class Program
     {
         private static Mutex appMutex;
@@ -110,6 +120,7 @@ namespace PCPowerRemote
         private string currentHost = Environment.MachineName;
         private string currentPin = "";
         private string activeAdapterDescription = "";
+        private bool isEthernetAdapter = false;
 
         private bool startMinimized;
 
@@ -207,6 +218,10 @@ namespace PCPowerRemote
                                 {
                                     currentMac = string.Join(":", macBytes.Select(b => b.ToString("X2")));
                                     activeAdapterDescription = nic.Description;
+                                    isEthernetAdapter = (nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet ||
+                                                         nic.NetworkInterfaceType == NetworkInterfaceType.GigabitEthernet ||
+                                                         nic.NetworkInterfaceType == NetworkInterfaceType.FastEthernetFx ||
+                                                         nic.NetworkInterfaceType == NetworkInterfaceType.FastEthernetT);
                                 }
                             }
                         }
@@ -214,6 +229,56 @@ namespace PCPowerRemote
                 }
             }
             catch { }
+        }
+
+        private bool IsFastStartupDisabled()
+        {
+            try
+            {
+                using (RegistryKey powerKey = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Session Manager\Power", false))
+                {
+                    if (powerKey != null)
+                    {
+                        object val = powerKey.GetValue("HiberbootEnabled");
+                        if (val != null)
+                        {
+                            return Convert.ToInt32(val) == 0;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return true;
+        }
+
+        private bool IsWakeArmed()
+        {
+            if (string.IsNullOrEmpty(activeAdapterDescription)) return true;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = "powercfg",
+                    Arguments = "/devicequery wake_armed",
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    if (p != null)
+                    {
+                        string output = p.StandardOutput.ReadToEnd();
+                        p.WaitForExit(3000);
+                        if (!string.IsNullOrEmpty(output) && output.IndexOf(activeAdapterDescription, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return false;
         }
 
         private void InitializeGui()
@@ -316,7 +381,7 @@ namespace PCPowerRemote
                     : "🔒 PIN de segurança salvo e ativado!");
                 MessageBox.Show(
                     string.IsNullOrEmpty(currentPin)
-                        ? "PIN desativado. Qualquer aparelho com o app no seu Wi-Fi poderá desligar o PC."
+                        ? "PIN desativado. Qualquer aparelho com o app no seu Wi-Fi poderá controlar o PC."
                         : "PIN salvo com sucesso! Digite o mesmo PIN no aplicativo Android.",
                     "PC Power Remote",
                     MessageBoxButtons.OK,
@@ -666,13 +731,27 @@ namespace PCPowerRemote
         private string BuildStatusJson()
         {
             DetectNetworkInfo();
+            bool wakeArmed = IsWakeArmed();
+            bool fastStartupDisabled = IsFastStartupDisabled();
+            bool readyForWol = isEthernetAdapter && wakeArmed && fastStartupDisabled;
+
+            string wolDiagJson = string.Format(
+                "{{\"isEthernet\":{0},\"adapterName\":\"{1}\",\"wakeArmed\":{2},\"fastStartupDisabled\":{3},\"readyForWol\":{4}}}",
+                isEthernetAdapter ? "true" : "false",
+                EscapeJson(activeAdapterDescription),
+                wakeArmed ? "true" : "false",
+                fastStartupDisabled ? "true" : "false",
+                readyForWol ? "true" : "false"
+            );
+
             return string.Format(
-                "{{\"status\":\"online\",\"hostname\":\"{0}\",\"ip\":\"{1}\",\"mac\":\"{2}\",\"port\":{3},\"requiresPin\":{4}}}",
+                "{{\"status\":\"online\",\"hostname\":\"{0}\",\"ip\":\"{1}\",\"mac\":\"{2}\",\"port\":{3},\"requiresPin\":{4},\"wolDiagnostics\":{5}}}",
                 EscapeJson(currentHost),
                 EscapeJson(currentIp),
                 EscapeJson(currentMac),
                 HTTP_PORT,
-                string.IsNullOrEmpty(currentPin) ? "false" : "true"
+                string.IsNullOrEmpty(currentPin) ? "false" : "true",
+                wolDiagJson
             );
         }
 
@@ -758,14 +837,12 @@ namespace PCPowerRemote
         {
             if (string.IsNullOrEmpty(currentPin)) return true;
 
-            // Verifica header X-Auth-Pin
             Match headerMatch = Regex.Match(rawRequest, @"X-Auth-Pin:\s*([^\r\n]+)", RegexOptions.IgnoreCase);
             if (headerMatch.Success && headerMatch.Groups[1].Value.Trim() == currentPin)
             {
                 return true;
             }
 
-            // Verifica campo "pin" no JSON
             Match jsonMatch = Regex.Match(rawRequest, "\"pin\"\\s*:\\s*\"([^\"]*)\"");
             if (jsonMatch.Success && jsonMatch.Groups[1].Value.Trim() == currentPin)
             {
@@ -773,6 +850,20 @@ namespace PCPowerRemote
             }
 
             return false;
+        }
+
+        private int ExtractDelayFromJson(string rawRequest, int defaultDelay)
+        {
+            try
+            {
+                Match match = Regex.Match(rawRequest, "\"delay\"\\s*:\\s*(\\d+)");
+                if (match.Success)
+                {
+                    return Math.Max(0, Math.Min(3600, int.Parse(match.Groups[1].Value)));
+                }
+            }
+            catch { }
+            return defaultDelay;
         }
 
         private void HandleClient(TcpClient client)
@@ -811,7 +902,7 @@ namespace PCPowerRemote
                             return;
                         }
 
-                        if (method == "POST" && (path == "/shutdown" || path == "/cancel-shutdown"))
+                        if (method == "POST")
                         {
                             if (!IsPinAuthorized(rawRequest))
                             {
@@ -822,15 +913,53 @@ namespace PCPowerRemote
 
                             if (path == "/shutdown")
                             {
-                                AppendLog("📲 Comando de DESLIGAR recebido pelo celular! Desligando em 5s...");
-                                RunHiddenCommand("shutdown", "/s /f /t 5 /c \"Desligamento solicitado pelo aplicativo Android (PC Power Remote).\"");
-                                SendHttpResponse(stream, 200, "{\"ok\":true,\"message\":\"Comando recebido! O computador será desligado em 5 segundos.\"}");
+                                int delay = ExtractDelayFromJson(rawRequest, 5);
+                                AppendLog(string.Format("📲 Comando de DESLIGAR recebido pelo celular! Desligando em {0}s...", delay));
+                                RunHiddenCommand("shutdown", string.Format("/s /f /t {0} /c \"Desligamento solicitado pelo aplicativo Android (PC Power Remote).\"", delay));
+                                SendHttpResponse(stream, 200, string.Format("{{\"ok\":true,\"message\":\"Comando recebido! O computador será desligado em {0} segundos.\"}}", delay));
                             }
-                            else
+                            else if (path == "/restart")
+                            {
+                                int delay = ExtractDelayFromJson(rawRequest, 5);
+                                AppendLog(string.Format("📲 Comando de REINICIAR recebido pelo celular! Reiniciando em {0}s...", delay));
+                                RunHiddenCommand("shutdown", string.Format("/r /f /t {0} /c \"Reinício solicitado pelo aplicativo Android (PC Power Remote).\"", delay));
+                                SendHttpResponse(stream, 200, string.Format("{{\"ok\":true,\"message\":\"Comando recebido! O computador será reiniciado em {0} segundos.\"}}", delay));
+                            }
+                            else if (path == "/sleep")
+                            {
+                                AppendLog("📲 Comando de SUSPENDER (Sleep) recebido pelo celular!");
+                                ThreadPool.QueueUserWorkItem(_ =>
+                                {
+                                    Thread.Sleep(800);
+                                    NativeMethods.SetSuspendState(false, true, true);
+                                });
+                                SendHttpResponse(stream, 200, "{\"ok\":true,\"message\":\"Computador entrando em modo de suspensão...\"}");
+                            }
+                            else if (path == "/hibernate")
+                            {
+                                AppendLog("📲 Comando de HIBERNAR recebido pelo celular!");
+                                ThreadPool.QueueUserWorkItem(_ =>
+                                {
+                                    Thread.Sleep(800);
+                                    NativeMethods.SetSuspendState(true, true, true);
+                                });
+                                SendHttpResponse(stream, 200, "{\"ok\":true,\"message\":\"Computador entrando em hibernação...\"}");
+                            }
+                            else if (path == "/lock")
+                            {
+                                AppendLog("📲 Comando de BLOQUEAR TELA (Win+L) recebido pelo celular!");
+                                NativeMethods.LockWorkStation();
+                                SendHttpResponse(stream, 200, "{\"ok\":true,\"message\":\"Tela do computador bloqueada com sucesso!\"}");
+                            }
+                            else if (path == "/cancel-shutdown")
                             {
                                 AppendLog("📲 Comando de CANCELAR DESLIGAMENTO recebido pelo celular.");
                                 RunHiddenCommand("shutdown", "/a");
-                                SendHttpResponse(stream, 200, "{\"ok\":true,\"message\":\"Desligamento cancelado com sucesso!\"}");
+                                SendHttpResponse(stream, 200, "{\"ok\":true,\"message\":\"Desligamento/reinício cancelado com sucesso!\"}");
+                            }
+                            else
+                            {
+                                SendHttpResponse(stream, 404, "{\"ok\":false,\"message\":\"Endpoint nao encontrado\"}");
                             }
                             return;
                         }
