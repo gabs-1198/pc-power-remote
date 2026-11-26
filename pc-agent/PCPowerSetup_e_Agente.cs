@@ -104,6 +104,11 @@ namespace PCPowerRemote
         private Thread udpThread;
         private volatile bool isRunning = false;
 
+        // Rate limiting de tentativas de PIN
+        private readonly Dictionary<string, int> failedAttempts = new Dictionary<string, int>();
+        private readonly Dictionary<string, DateTime> blockedIps = new Dictionary<string, DateTime>();
+        private readonly object securityLock = new object();
+
         private NotifyIcon trayIcon;
         private ContextMenuStrip trayMenu;
 
@@ -833,6 +838,53 @@ namespace PCPowerRemote
             }
         }
 
+        private bool IsIpBlocked(string clientIp)
+        {
+            lock (securityLock)
+            {
+                if (blockedIps.ContainsKey(clientIp))
+                {
+                    if (DateTime.UtcNow < blockedIps[clientIp])
+                    {
+                        return true;
+                    }
+                    blockedIps.Remove(clientIp);
+                    failedAttempts.Remove(clientIp);
+                }
+                return false;
+            }
+        }
+
+        private void RegisterFailedAttempt(string clientIp)
+        {
+            lock (securityLock)
+            {
+                int count = 1;
+                if (failedAttempts.ContainsKey(clientIp))
+                {
+                    count = failedAttempts[clientIp] + 1;
+                }
+                failedAttempts[clientIp] = count;
+
+                if (count >= 5)
+                {
+                    blockedIps[clientIp] = DateTime.UtcNow.AddMinutes(15);
+                    AppendLog("🚨 ALERTA: IP " + clientIp + " bloqueado por 15 minutos (5 tentativas inválidas de PIN).");
+                }
+            }
+        }
+
+        private void ResetFailedAttempts(string clientIp)
+        {
+            lock (securityLock)
+            {
+                if (failedAttempts.ContainsKey(clientIp))
+                {
+                    failedAttempts.Remove(clientIp);
+                }
+            }
+        }
+
         private bool IsPinAuthorized(string rawRequest)
         {
             if (string.IsNullOrEmpty(currentPin)) return true;
@@ -872,6 +924,19 @@ namespace PCPowerRemote
             {
                 try
                 {
+                    string clientIp = "unknown";
+                    IPEndPoint ep = client.Client.RemoteEndPoint as IPEndPoint;
+                    if (ep != null)
+                    {
+                        clientIp = ep.Address.ToString();
+                    }
+
+                    if (IsIpBlocked(clientIp))
+                    {
+                        AppendLog("⛔ Conexão rejeitada: IP " + clientIp + " temporariamente bloqueado por força bruta.");
+                        return;
+                    }
+
                     client.ReceiveTimeout = 3000;
                     client.SendTimeout = 3000;
                     using (NetworkStream stream = client.GetStream())
@@ -890,6 +955,19 @@ namespace PCPowerRemote
                         string method = requestParts[0].ToUpperInvariant();
                         string path = requestParts[1].Split('?')[0];
 
+                        // PROTEÇÃO ANTI-CSRF / BROWSER EXPLOIT:
+                        // Rejeita requisições originadas por navegadores da internet (Origin ou Referer de sites externos)
+                        bool hasOrigin = Regex.IsMatch(rawRequest, @"\r\nOrigin:\s*http", RegexOptions.IgnoreCase);
+                        bool hasReferer = Regex.IsMatch(rawRequest, @"\r\nReferer:\s*http", RegexOptions.IgnoreCase);
+                        bool hasClientHeader = Regex.IsMatch(rawRequest, @"\r\nX-PC-Power-Client:\s*1", RegexOptions.IgnoreCase);
+
+                        if (hasOrigin || hasReferer)
+                        {
+                            AppendLog("🛑 Bloqueio CSRF: Tentativa de acesso originada por navegador web externo descartada de " + clientIp);
+                            SendHttpResponse(stream, 403, "{\"ok\":false,\"message\":\"Acesso proibido via navegador web (CSRF Protection).\"}");
+                            return;
+                        }
+
                         if (method == "OPTIONS")
                         {
                             SendHttpResponse(stream, 204, "{}");
@@ -904,12 +982,23 @@ namespace PCPowerRemote
 
                         if (method == "POST")
                         {
+                            // Para comandos críticos de desligamento/reinício/sleep, exige o cabeçalho do app
+                            if (!hasClientHeader)
+                            {
+                                AppendLog("⛔ Bloqueio de segurança: Header X-PC-Power-Client ausente em POST de " + clientIp);
+                                SendHttpResponse(stream, 400, "{\"ok\":false,\"message\":\"Cliente não identificado.\"}");
+                                return;
+                            }
+
                             if (!IsPinAuthorized(rawRequest))
                             {
-                                AppendLog("⛔ Tentativa bloqueada: PIN incorreto ou não informado.");
+                                RegisterFailedAttempt(clientIp);
+                                AppendLog("⛔ Tentativa bloqueada: PIN incorreto ou não informado de " + clientIp);
                                 SendHttpResponse(stream, 401, "{\"ok\":false,\"message\":\"PIN de segurança incorreto ou não informado.\"}");
                                 return;
                             }
+
+                            ResetFailedAttempts(clientIp);
 
                             if (path == "/shutdown")
                             {
@@ -973,14 +1062,13 @@ namespace PCPowerRemote
 
         private void SendHttpResponse(NetworkStream stream, int statusCode, string jsonBody)
         {
-            string statusText = statusCode == 200 ? "OK" : (statusCode == 204 ? "No Content" : (statusCode == 401 ? "Unauthorized" : "Not Found"));
+            string statusText = statusCode == 200 ? "OK" : (statusCode == 204 ? "No Content" : (statusCode == 401 ? "Unauthorized" : (statusCode == 403 ? "Forbidden" : (statusCode == 400 ? "Bad Request" : "Not Found"))));
             byte[] bodyBytes = Encoding.UTF8.GetBytes(jsonBody);
+            // ZERO CORS WILDCARD: Remove Access-Control-Allow-Origin: * para impedir sites web de chamar o agente
             string headers =
                 string.Format("HTTP/1.1 {0} {1}\r\n", statusCode, statusText) +
                 "Content-Type: application/json; charset=utf-8\r\n" +
-                "Access-Control-Allow-Origin: *\r\n" +
-                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
-                "Access-Control-Allow-Headers: Content-Type, X-Auth-Pin\r\n" +
+                "X-Content-Type-Options: nosniff\r\n" +
                 string.Format("Content-Length: {0}\r\n", bodyBytes.Length) +
                 "Connection: close\r\n\r\n";
 

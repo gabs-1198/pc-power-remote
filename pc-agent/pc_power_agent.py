@@ -148,7 +148,7 @@ class PowerRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -161,9 +161,6 @@ class PowerRequestHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Pin")
         self.end_headers()
 
     def do_GET(self):
@@ -173,6 +170,18 @@ class PowerRequestHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "Endpoint não encontrado"})
 
     def do_POST(self):
+        # Proteção anti-CSRF: descarta requisições originadas por navegadores externos
+        origin = self.headers.get("Origin", "")
+        referer = self.headers.get("Referer", "")
+        if origin or referer:
+            self._send_json(403, {"ok": False, "message": "Acesso proibido via navegador web (CSRF Protection)."})
+            return
+
+        client_header = self.headers.get("X-PC-Power-Client", "")
+        if client_header != "1":
+            self._send_json(400, {"ok": False, "message": "Cliente não identificado."})
+            return
+
         content_length = int(self.headers.get("Content-Length", 0))
         body_data = {}
         if content_length > 0:

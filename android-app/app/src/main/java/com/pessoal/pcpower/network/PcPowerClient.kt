@@ -343,6 +343,7 @@ object PcPowerClient {
                 readTimeout = 3000
                 doOutput = true
                 setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("X-PC-Power-Client", "1")
                 if (config.pin.isNotBlank()) {
                     setRequestProperty("X-Auth-Pin", config.pin.trim())
                 }
